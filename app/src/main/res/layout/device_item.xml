@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:layout_marginTop="6dp"
+    android:layout_marginBottom="6dp"
+    android:background="@drawable/device_card_background">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/txtOnlineIndicator"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="●"
+            android:textSize="22sp"
+            android:textColor="#2E7D32"
+            android:layout_marginEnd="10dp" />
+
+        <TextView
+            android:id="@+id/txtDeviceName"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Unknown Device"
+            android:textSize="19sp"
+            android:textStyle="bold"
+            android:textColor="#212121" />
+
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/txtDeviceIp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="IP Address: 192.168.1.1"
+        android:textSize="16sp"
+        android:textColor="#424242"
+        android:layout_marginTop="12dp" />
+
+    <TextView
+        android:id="@+id/txtDeviceHostname"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Hostname: Unknown"
+        android:textSize="15sp"
+        android:textColor="#616161"
+        android:layout_marginTop="5dp" />
+
+    <TextView
+        android:id="@+id/txtDeviceStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Status: Online"
+        android:textSize="15sp"
+        android:textColor="#2E7D32"
+        android:layout_marginTop="5dp" />
+
+    <Button
+        android:id="@+id/btnDetails"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Details"
+        android:layout_gravity="end"
+        android:layout_marginTop="10dp" />
+		
+		<TextView
+    android:id="@+id/txtDeviceMac"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:text="MAC Address: Unavailable"
+    android:textSize="15sp"
+    android:textColor="#616161"
+    android:layout_marginTop="5dp" />
+
+</LinearLayout>
