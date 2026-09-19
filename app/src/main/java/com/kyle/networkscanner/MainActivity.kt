@@ -1,6 +1,11 @@
 package com.kyle.networkscanner
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.Color
@@ -12,6 +17,7 @@ import android.graphics.drawable.RippleDrawable
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -20,38 +26,22 @@ import android.os.SystemClock
 import android.system.ErrnoException
 import android.system.OsConstants
 import android.text.InputType
-import android.view.View
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
-import android.widget.ScrollView
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ProgressBar
-import android.widget.TextView
+import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import java.io.File
-import java.net.Inet4Address
-import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.NetworkInterface
-import java.net.Socket
-import java.util.Locale
+import java.net.*
+import java.text.SimpleDateFormat
+import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
-
-/*
- * Requires minSdkVersion 21 or later and these manifest permissions:
- * android.permission.INTERNET
- * android.permission.ACCESS_NETWORK_STATE
- *
- * The dashboard is built in Kotlin.
- * No layout XML or drawable files are required.
- *
- * Keep only ONE NetworkDevice declaration in the project.
- */
 
 data class NetworkDevice(
     val ipAddress: String,
@@ -61,71 +51,49 @@ data class NetworkDevice(
     var deviceType: String,
     var isThisDevice: Boolean,
     var openPorts: MutableList<Int>,
-    var portsChecked: Boolean = false
+    var portsChecked: Boolean = false,
+    var isNewDevice: Boolean = false,
+    var firstSeen: Long = 0L,
+    var lastSeen: Long = 0L
 )
 
-// Long arithmetic prevents signed-Int overflow for IPv4 addresses.
-private data class Ipv4Subnet(
-    val local: Long,
-    val prefix: Int
-) {
-    init {
-        require(local in 0L..0xFFFFFFFFL)
-        require(prefix in 0..32)
-    }
+private data class KnownDevice(
+    val ipAddress: String,
+    var hostname: String,
+    var macAddress: String,
+    var deviceType: String,
+    var firstSeen: Long,
+    var lastSeen: Long
+)
 
-    val mask: Long =
-        (0xFFFFFFFFL shl (32 - prefix)) and 0xFFFFFFFFL
-
-    val network: Long = local and mask
-
-    val broadcast: Long =
-        network or (mask xor 0xFFFFFFFFL)
-
-    // /31 links have two usable addresses; /32 has one.
-    val first: Long =
-        if (prefix >= 31) network else network + 1L
-
-    val last: Long =
-        if (prefix >= 31) broadcast else broadcast - 1L
-
-    val hostCount: Long = last - first + 1L
-
-    val cidr: String
-        get() = "${ipv4Text(network)}/$prefix"
+private data class Ipv4Subnet(val local: Long, val prefix: Int) {
+    val mask = (0xFFFFFFFFL shl (32 - prefix)) and 0xFFFFFFFFL
+    val network = local and mask
+    val broadcast = network or (mask xor 0xFFFFFFFFL)
+    val first = if (prefix >= 31) network else network + 1
+    val last = if (prefix >= 31) broadcast else broadcast - 1
+    val hostCount = last - first + 1
+    val cidr get() = "${ipv4Text(network)}/$prefix"
 }
 
 private fun ipv4Number(address: Inet4Address): Long {
     var value = 0L
-
-    for (byte in address.address) {
-        value = (value shl 8) or (byte.toLong() and 255L)
-    }
-
+    for (b in address.address) value = (value shl 8) or (b.toLong() and 255)
     return value
 }
 
-private fun ipv4Text(value: Long): String =
-    "${(value shr 24) and 255L}.${(value shr 16) and 255L}." +
-        "${(value shr 8) and 255L}.${value and 255L}"
+private fun ipv4Text(v: Long) =
+    "${(v shr 24) and 255}.${(v shr 16) and 255}.${(v shr 8) and 255}.${v and 255}"
 
 private fun parseIpv4(text: String): Long? {
-    val parts = text.trim().split(".")
-
-    if (parts.size != 4) return null
-
+    val p = text.trim().split(".")
+    if (p.size != 4) return null
     var result = 0L
 
-    for (part in parts) {
-        if (part.isEmpty() || part.any { it !in '0'..'9' }) {
-            return null
-        }
-
-        val octet = part.toIntOrNull() ?: return null
-
-        if (octet !in 0..255) return null
-
-        result = (result shl 8) or octet.toLong()
+    for (part in p) {
+        val n = part.toIntOrNull() ?: return null
+        if (n !in 0..255) return null
+        result = (result shl 8) or n.toLong()
     }
 
     return result
@@ -133,32 +101,22 @@ private fun parseIpv4(text: String): Long? {
 
 class MainActivity : AppCompatActivity() {
 
-    // =========================================================
-    // UI
-    // =========================================================
-
     private lateinit var txtIpAddress: TextView
     private lateinit var txtSubnet: TextView
     private lateinit var txtStatus: TextView
     private lateinit var txtDevicesFound: TextView
-    private lateinit var btnScan: Button
-    private lateinit var progressScan: ProgressBar
-    private lateinit var deviceContainer: LinearLayout
-    private lateinit var connectivity: ConnectivityManager
     private lateinit var txtPortCount: TextView
     private lateinit var txtCheckedCount: TextView
     private lateinit var txtPhase: TextView
     private lateinit var txtTransport: TextView
     private lateinit var txtResultNote: TextView
+    private lateinit var btnScan: Button
+    private lateinit var progressScan: ProgressBar
+    private lateinit var deviceContainer: LinearLayout
     private lateinit var emptyState: LinearLayout
+    private lateinit var connectivity: ConnectivityManager
     private lateinit var radar: RadarView
-
-    private var checkedHosts = 0
-    private var totalHosts = 0
-
-    // =========================================================
-    // COLORS
-    // =========================================================
+    private lateinit var preferences: SharedPreferences
 
     private val ink = Color.rgb(8, 13, 18)
     private val panel = Color.rgb(17, 25, 33)
@@ -167,38 +125,37 @@ class MainActivity : AppCompatActivity() {
     private val cyan = Color.rgb(88, 222, 235)
     private val primaryText = Color.rgb(235, 243, 246)
     private val mutedText = Color.rgb(151, 171, 183)
-
-    // =========================================================
-    // STATE
-    // =========================================================
+    private val alertColor = Color.rgb(255, 190, 80)
 
     private val ui = Handler(Looper.getMainLooper())
     private val devices = LinkedHashMap<String, NetworkDevice>()
     private val cards = HashMap<String, View>()
+    private val knownDevices = LinkedHashMap<String, KnownDevice>()
+    private val notifiedThisScan = HashSet<String>()
 
+    private var checkedHosts = 0
+    private var totalHosts = 0
     private var selectedLan: Lan? = null
     private var session: ScanSession? = null
     private var destroyed = false
     private var inputDialog: AlertDialog? = null
+    private var baselineEstablished = false
 
     companion object {
         private const val WORKERS = 40
         private const val MAX_HOSTS_PER_SCAN = 4096L
         private const val CONNECT_TIMEOUT_MS = 250
+        private const val PREFS_NAME = "net_scanner_devices"
+        private const val PREF_BASELINE = "baseline_established"
+        private const val PREF_DEVICE_SET = "known_devices"
+        private const val CHANNEL_ID = "new_device_alerts"
+        private const val CHANNEL_NAME = "New Device Alerts"
+        private const val NOTIFICATION_REQUEST = 1001
+        private const val POST_NOTIFICATIONS_PERMISSION = "android.permission.POST_NOTIFICATIONS"
 
         private val PORTS = intArrayOf(
-            22,
-            53,
-            80,
-            139,
-            443,
-            445,
-            554,
-            631,
-            8008,
-            8009,
-            8080,
-            9100
+            22, 53, 80, 139, 443, 445, 554, 631,
+            8008, 8009, 8080, 9100
         )
     }
 
@@ -210,72 +167,169 @@ class MainActivity : AppCompatActivity() {
         val subnet: Ipv4Subnet
     )
 
-    private class ScanSession(
-        val lan: Lan,
-        val first: Long,
-        val last: Long
-    ) {
+    private class ScanSession(val lan: Lan, val first: Long, val last: Long) {
         val nextAddress = AtomicLong(first)
-
-        val total = (last - first + 1L).toInt()
-
-        val executor =
-            Executors.newFixedThreadPool(minOf(WORKERS, total))
-
+        val total = (last - first + 1).toInt()
+        val executor = Executors.newFixedThreadPool(minOf(WORKERS, total))
         val sockets = ConcurrentHashMap<Socket, Boolean>()
 
-        @Volatile
-        var cancelled = false
-
-        // Only the main thread updates this counter.
+        @Volatile var cancelled = false
         var completed = 0
 
         fun stop() {
             cancelled = true
-
-            for (socket in sockets.keys) {
-                try {
-                    socket.close()
-                } catch (_: Exception) {
-                }
+            sockets.keys.forEach {
+                try { it.close() } catch (_: Exception) {}
             }
-
             executor.shutdownNow()
         }
     }
 
-    // =========================================================
-    // ACTIVITY SETUP
-    // =========================================================
-
     override fun onCreate(savedInstanceState: Bundle?) {
-        setTheme(
-            androidx.appcompat.R.style.Theme_AppCompat_NoActionBar
-        )
-
+        setTheme(androidx.appcompat.R.style.Theme_AppCompat_NoActionBar)
         super.onCreate(savedInstanceState)
 
         buildDashboard()
 
-        connectivity =
-            getSystemService(Context.CONNECTIVITY_SERVICE)
-                as ConnectivityManager
+        connectivity = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        preferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        baselineEstablished = preferences.getBoolean(PREF_BASELINE, false)
+
+        loadKnownDevices()
+        createNotificationChannel()
+        requestNotificationPermission()
 
         btnScan.setOnClickListener {
-            if (session != null) {
-                stopScan("Scan cancelled")
-            } else {
-                chooseNetwork()
-            }
+            if (session != null) stopScan("Scan cancelled") else chooseNetwork()
         }
     }
 
-    // =========================================================
-    // UI HELPERS
-    // =========================================================
+    // ==================== KNOWN DEVICES ====================
 
-    private fun dp(value: Int): Int =
-        (value * resources.displayMetrics.density + 0.5f).toInt()
+    private fun loadKnownDevices() {
+        knownDevices.clear()
+
+        preferences.getStringSet(PREF_DEVICE_SET, emptySet())?.forEach {
+            try {
+                val p = it.split("|")
+                if (p.size < 6) return@forEach
+
+                val first = p[4].toLongOrNull() ?: return@forEach
+                val last = p[5].toLongOrNull() ?: first
+
+                knownDevices[p[0]] =
+                    KnownDevice(p[0], p[1], p[2], p[3], first, last)
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun saveKnownDevices() {
+        val set = knownDevices.values.map {
+            "${it.ipAddress}|${it.hostname.replace("|", " ")}|" +
+                "${it.macAddress.replace("|", " ")}|" +
+                "${it.deviceType.replace("|", " ")}|${it.firstSeen}|${it.lastSeen}"
+        }.toSet()
+
+        preferences.edit().putStringSet(PREF_DEVICE_SET, set).apply()
+    }
+
+    private fun registerDevice(d: NetworkDevice) {
+        val now = System.currentTimeMillis()
+        val old = knownDevices[d.ipAddress]
+
+        if (old != null) {
+            d.isNewDevice = false
+            d.firstSeen = old.firstSeen
+            d.lastSeen = now
+            old.hostname = d.hostname
+            old.macAddress = d.macAddress
+            old.deviceType = d.deviceType
+            old.lastSeen = now
+        } else {
+            d.firstSeen = now
+            d.lastSeen = now
+            d.isNewDevice = baselineEstablished && !d.isThisDevice
+
+            knownDevices[d.ipAddress] = KnownDevice(
+                d.ipAddress, d.hostname, d.macAddress,
+                d.deviceType, now, now
+            )
+
+            if (d.isNewDevice && notifiedThisScan.add(d.ipAddress))
+                showNewDeviceNotification(d)
+        }
+
+        if (d.isThisDevice) d.isNewDevice = false
+        saveKnownDevices()
+    }
+
+    // ==================== NOTIFICATIONS ====================
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT < 26) return
+
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            CHANNEL_NAME,
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Alerts when a new device appears on the local network"
+            enableVibration(true)
+        }
+
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+            .createNotificationChannel(channel)
+    }
+
+    private fun requestNotificationPermission() {
+        if (
+            Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(
+                this,
+                POST_NOTIFICATIONS_PERMISSION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(POST_NOTIFICATIONS_PERMISSION),
+                NOTIFICATION_REQUEST
+            )
+        }
+    }
+
+    private fun showNewDeviceNotification(d: NetworkDevice) {
+        if (
+            Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(
+                this,
+                POST_NOTIFICATIONS_PERMISSION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) return
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle("New device detected")
+            .setContentText("${d.ipAddress} · ${d.deviceType}")
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    "A previously unseen device responded on your network.\n\n" +
+                        "IP: ${d.ipAddress}\n" +
+                        "Device: ${d.hostname}\n" +
+                        "Type: ${d.deviceType}"
+                )
+            )
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .build()
+
+        try {
+            NotificationManagerCompat.from(this)
+                .notify(d.ipAddress.hashCode() and 0x7FFFFFFF, notification)
+        } catch (_: SecurityException) {}
+    }
+
+    // ==================== UI HELPERS ====================
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density + .5f).toInt()
 
     private fun surface(
         fill: Int = panel,
@@ -288,23 +342,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun label(
-        value: String,
+        textValue: String,
         size: Float = 14f,
         color: Int = primaryText,
         mono: Boolean = false,
         bold: Boolean = false
     ) = TextView(this).apply {
-        text = value
+        text = textValue
         textSize = size
         setTextColor(color)
-
         typeface = Typeface.create(
             if (mono) "monospace" else "sans-serif",
             if (bold) Typeface.BOLD else Typeface.NORMAL
         )
-
         includeFontPadding = false
-        setLineSpacing(dp(3).toFloat(), 1f)
     }
 
     private fun column() = LinearLayout(this).apply {
@@ -316,69 +367,40 @@ class MainActivity : AppCompatActivity() {
         gravity = Gravity.CENTER_VERTICAL
     }
 
-    private fun addBlock(
-        parent: LinearLayout,
-        child: View,
-        gap: Int = 12
-    ) {
+    private fun addBlock(parent: LinearLayout, view: View, gap: Int = 12) {
         parent.addView(
-            child,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = dp(gap)
-            }
+            view,
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(gap) }
         )
     }
 
-    private fun badge(
-        value: String,
-        color: Int = cyan
-    ) = label(
-        value,
-        11f,
-        color,
-        true,
-        true
-    ).apply {
-        background = surface(panel, border, 8)
-        setPadding(dp(10), dp(7), dp(10), dp(7))
-    }
+    private fun badge(text: String, color: Int = cyan) =
+        label(text, 11f, color, true, true).apply {
+            background = surface(panel, border, 8)
+            setPadding(dp(10), dp(7), dp(10), dp(7))
+        }
 
-    private fun action(
-        value: String,
-        filled: Boolean = false
-    ) = Button(this).apply {
-        text = value
-        textSize = 13f
-        typeface = Typeface.create("monospace", Typeface.BOLD)
-        isAllCaps = false
-
-        setTextColor(if (filled) ink else cyan)
-
-        minHeight = dp(50)
-        minimumHeight = dp(50)
-        minWidth = 0
-        minimumWidth = 0
-
-        setPadding(dp(16), dp(10), dp(16), dp(10))
-
-        // Remove theme tint so the terminal palette stays consistent.
-        backgroundTintList = null
-
-        background = RippleDrawable(
-            ColorStateList.valueOf(0x3368DDEB),
-            surface(
-                if (filled) lime else panel,
-                if (filled) lime else border,
-                12
-            ),
-            null
-        )
-
-        stateListAnimator = null
-    }
+    private fun action(text: String, filled: Boolean = false) =
+        Button(this).apply {
+            this.text = text
+            textSize = 13f
+            isAllCaps = false
+            typeface = Typeface.create("monospace", Typeface.BOLD)
+            setTextColor(if (filled) ink else cyan)
+            minHeight = dp(50)
+            minimumHeight = dp(50)
+            backgroundTintList = null
+            background = RippleDrawable(
+                ColorStateList.valueOf(0x3368DDEB),
+                surface(
+                    if (filled) lime else panel,
+                    if (filled) lime else border,
+                    12
+                ),
+                null
+            )
+            stateListAnimator = null
+        }
 
     private fun metric(
         parent: LinearLayout,
@@ -391,50 +413,24 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(12), dp(16), dp(8), dp(16))
         }
 
-        val number = label("0", 26f, color, true, true)
-
-        box.addView(number)
-
-        addBlock(
-            box,
-            label(title, 10f, mutedText, true),
-            8
-        )
+        val value = label("0", 26f, color, true, true)
+        box.addView(value)
+        addBlock(box, label(title, 10f, mutedText, true), 8)
 
         parent.addView(
             box,
-            LinearLayout.LayoutParams(
-                0,
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                1f
-            ).apply {
+            LinearLayout.LayoutParams(0, -1, 1f).apply {
                 if (gap) marginStart = dp(8)
             }
         )
 
-        return number
+        return value
     }
 
-    // =========================================================
-    // DASHBOARD
-    // =========================================================
+    // ==================== DASHBOARD ====================
 
     @Suppress("DEPRECATION")
     private fun buildDashboard() {
-        // Compatible with the project's older AndroidX dependencies.
-        window.clearFlags(
-            android.view.WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS or
-                android.view.WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION
-        )
-
-        window.addFlags(
-            android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
-        )
-
-        // Normal window bounds and light icons on dark system bars.
-        window.decorView.systemUiVisibility =
-            View.SYSTEM_UI_FLAG_VISIBLE
-
         window.statusBarColor = ink
         window.navigationBarColor = ink
 
@@ -446,7 +442,6 @@ class MainActivity : AppCompatActivity() {
         val scroll = ScrollView(this).apply {
             isFillViewport = true
             isVerticalScrollBarEnabled = false
-            overScrollMode = View.OVER_SCROLL_NEVER
         }
 
         val content = column().apply {
@@ -454,220 +449,85 @@ class MainActivity : AppCompatActivity() {
         }
 
         scroll.addView(content)
-
-        root.addView(
-            scroll,
-            LinearLayout.LayoutParams(-1, -1)
-        )
-
+        root.addView(scroll, LinearLayout.LayoutParams(-1, -1))
         setContentView(root)
-        root.requestApplyInsets()
 
-        // Header
         val header = row()
+        header.addView(label("[ N ]", 23f, lime, true, true))
 
-        header.addView(
-            label("[ N ]", 23f, lime, true, true)
-        )
-
-        val brand = column().apply {
-            setPadding(dp(12), 0, 0, 0)
-        }
-
-        brand.addView(
-            label(
-                "NET / SCANNER",
-                17f,
-                primaryText,
-                false,
-                true
-            )
-        )
-
-        addBlock(
-            brand,
-            label(
-                "LOCAL NETWORK CONSOLE",
-                10f,
-                mutedText,
-                true
-            ),
-            5
-        )
-
-        header.addView(
-            brand,
-            LinearLayout.LayoutParams(0, -2, 1f)
-        )
+        val brand = column().apply { setPadding(dp(12), 0, 0, 0) }
+        brand.addView(label("NET / SCANNER", 17f, primaryText, false, true))
+        addBlock(brand, label("LOCAL NETWORK CONSOLE", 10f, mutedText, true), 5)
+        header.addView(brand)
 
         content.addView(header)
-
+        addBlock(content, label("Network overview", 28f, primaryText, false, true), 28)
         addBlock(
             content,
-            label(
-                "Network overview",
-                28f,
-                primaryText,
-                false,
-                true
-            ),
-            28
-        )
-
-        addBlock(
-            content,
-            label(
-                "Discover devices. Inspect services.",
-                14f,
-                mutedText
-            ),
+            label("Discover devices. Inspect services. Detect changes.", 14f, mutedText),
             8
         )
 
-        // Network overview card
         val hero = column().apply {
             background = surface()
             setPadding(dp(18), dp(18), dp(18), dp(18))
         }
 
         val heroTop = row()
-
-        txtPhase = label(
-            "●  STANDBY",
-            12f,
-            lime,
-            true,
-            true
-        )
-
-        heroTop.addView(
-            txtPhase,
-            LinearLayout.LayoutParams(0, -2, 1f)
-        )
+        txtPhase = label("●  STANDBY", 12f, lime, true, true)
+        heroTop.addView(txtPhase, LinearLayout.LayoutParams(0, -2, 1f))
 
         txtTransport = badge("NO LINK")
-
         heroTop.addView(txtTransport)
         hero.addView(heroTop)
 
         radar = RadarView(this)
+        hero.addView(radar, LinearLayout.LayoutParams(-1, dp(154)))
 
-        hero.addView(
-            radar,
-            LinearLayout.LayoutParams(-1, dp(154)).apply {
-                topMargin = dp(8)
-            }
-        )
-
-        txtIpAddress = label(
-            "No local IPv4",
-            22f,
-            primaryText,
-            true,
-            true
-        )
-
-        addBlock(
-            hero,
-            label("LOCAL ADDRESS", 10f, mutedText, true),
-            4
-        )
-
+        txtIpAddress = label("No local IPv4", 22f, primaryText, true, true)
+        addBlock(hero, label("LOCAL ADDRESS", 10f, mutedText, true), 4)
         addBlock(hero, txtIpAddress, 8)
 
-        txtSubnet = label(
-            "Connect to Wi-Fi or Ethernet",
-            12f,
-            mutedText,
-            true
-        )
-
+        txtSubnet = label("Connect to Wi-Fi or Ethernet", 12f, mutedText, true)
         addBlock(hero, txtSubnet, 10)
         addBlock(content, hero, 24)
 
-        // Metrics
         val metrics = row()
-
-        txtDevicesFound = metric(
-            metrics,
-            "DEVICES",
-            lime,
-            false
-        )
-
-        txtPortCount = metric(
-            metrics,
-            "OPEN PORTS",
-            cyan,
-            true
-        )
-
-        txtCheckedCount = metric(
-            metrics,
-            "CHECKED",
-            primaryText,
-            true
-        )
-
+        txtDevicesFound = metric(metrics, "DEVICES", lime, false)
+        txtPortCount = metric(metrics, "OPEN PORTS", cyan, true)
+        txtCheckedCount = metric(metrics, "CHECKED", primaryText, true)
         addBlock(content, metrics, 12)
 
-        // Scan controls
         val scanPanel = column().apply {
             background = surface()
             setPadding(dp(16), dp(16), dp(16), dp(16))
         }
 
-        scanPanel.addView(
-            label(">_ SCAN SESSION", 11f, cyan, true, true)
-        )
+        scanPanel.addView(label(">_ SCAN SESSION", 11f, cyan, true, true))
 
-        txtStatus = label(
-            "Waiting for a local network",
-            13f,
-            primaryText,
-            true
-        )
-
+        txtStatus = label("Waiting for a local network", 13f, primaryText, true)
         addBlock(scanPanel, txtStatus, 12)
 
         progressScan = ProgressBar(
-            this,
-            null,
-            android.R.attr.progressBarStyleHorizontal
+            this, null, android.R.attr.progressBarStyleHorizontal
         ).apply {
-            isIndeterminate = false
-
-            progressTintList =
-                ColorStateList.valueOf(lime)
-
-            progressBackgroundTintList =
-                ColorStateList.valueOf(border)
-
+            progressTintList = ColorStateList.valueOf(lime)
+            progressBackgroundTintList = ColorStateList.valueOf(border)
             visibility = View.GONE
         }
 
         scanPanel.addView(
             progressScan,
-            LinearLayout.LayoutParams(-1, dp(8)).apply {
-                topMargin = dp(12)
-            }
+            LinearLayout.LayoutParams(-1, dp(8)).apply { topMargin = dp(12) }
         )
 
         btnScan = action("Start scan  →", true)
-
         addBlock(scanPanel, btnScan, 16)
         addBlock(content, scanPanel, 12)
 
-        // Results
         addBlock(
             content,
-            label(
-                "Discovered devices",
-                20f,
-                primaryText,
-                false,
-                true
-            ),
+            label("Discovered devices", 20f, primaryText, false, true),
             26
         )
 
@@ -676,7 +536,6 @@ class MainActivity : AppCompatActivity() {
             12f,
             mutedText
         )
-
         addBlock(content, txtResultNote, 6)
 
         emptyState = column().apply {
@@ -685,47 +544,31 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(24), dp(28), dp(24), dp(28))
         }
 
-        emptyState.addView(
-            label("[  ·  ·  ·  ]", 24f, cyan, true)
-        )
+        emptyState.addView(label("[  ·  ·  ·  ]", 24f, cyan, true))
 
         addBlock(
             emptyState,
-            label(
-                "Your network, mapped here",
-                16f,
-                primaryText,
-                false,
-                true
-            ).apply {
-                gravity = Gravity.CENTER
-            },
+            label("Your network, mapped here", 16f, primaryText, false, true),
             16
         )
 
         addBlock(
             emptyState,
-            label(
-                "Start a scan to see device addresses and services.",
-                13f,
-                mutedText
-            ).apply {
-                gravity = Gravity.CENTER
-            },
+            label("Start a scan to see device addresses and services.", 13f, mutedText),
             8
         )
 
         addBlock(content, emptyState, 14)
 
         deviceContainer = column()
-
         addBlock(content, deviceContainer, 2)
 
         addBlock(
             content,
             label(
-                "Results are a snapshot of the last scan.\n" +
-                    "Open ports are detected services, not a security verdict.",
+                "NEW = first detected after your baseline scan.\n" +
+                    "KNOWN = previously observed device.\n" +
+                    "Web interfaces can be opened from Inspect Device.",
                 11f,
                 mutedText
             ),
@@ -736,40 +579,19 @@ class MainActivity : AppCompatActivity() {
     private fun updateMetrics() {
         txtDevicesFound.text = devices.size.toString()
 
-        txtPortCount.text = devices.values.fold(0) { sum, device ->
-            sum + device.openPorts.size
-        }.toString()
+        var ports = 0
+        devices.values.forEach { ports += it.openPorts.size }
 
+        txtPortCount.text = ports.toString()
         txtCheckedCount.text = checkedHosts.toString()
-
-        txtCheckedCount.contentDescription =
-            "$checkedHosts of $totalHosts addresses checked"
-
-        txtDevicesFound.contentDescription =
-            "${devices.size} devices, including this device"
-
-        txtPortCount.contentDescription =
-            "${txtPortCount.text} open TCP ports across all devices"
-
-        emptyState.visibility =
-            if (devices.isEmpty()) View.VISIBLE else View.GONE
+        emptyState.visibility = if (devices.isEmpty()) View.VISIBLE else View.GONE
     }
 
-    private fun setScanAppearance(
-        scanning: Boolean,
-        phase: String
-    ) {
+    private fun setScanAppearance(scanning: Boolean, phase: String) {
         txtPhase.text = "●  $phase"
-
-        txtPhase.setTextColor(
-            if (scanning) lime else cyan
-        )
-
+        txtPhase.setTextColor(if (scanning) lime else cyan)
         radar.setScanning(scanning)
-
-        btnScan.setTextColor(
-            if (scanning) primaryText else ink
-        )
+        btnScan.setTextColor(if (scanning) primaryText else ink)
 
         btnScan.background = RippleDrawable(
             ColorStateList.valueOf(0x3368DDEB),
@@ -782,22 +604,12 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    // =========================================================
-    // DECORATIVE RADAR
-    // =========================================================
+    // ==================== RADAR ====================
 
-    private inner class RadarView(
-        context: Context
-    ) : View(context) {
-
+    private inner class RadarView(context: Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val bounds = RectF()
         private var scanning = false
-
-        init {
-            importantForAccessibility =
-                View.IMPORTANT_FOR_ACCESSIBILITY_NO
-        }
 
         fun setScanning(value: Boolean) {
             scanning = value
@@ -809,244 +621,113 @@ class MainActivity : AppCompatActivity() {
 
             val cx = width / 2f
             val cy = height / 2f
-            val radius = minOf(width, height) * 0.42f
+            val radius = minOf(width, height) * .42f
 
-            paint.shader = null
             paint.style = Paint.Style.STROKE
             paint.strokeWidth = resources.displayMetrics.density
             paint.color = border
 
-            for (ring in 1..3) {
-                canvas.drawCircle(
-                    cx,
-                    cy,
-                    radius * ring / 3f,
-                    paint
-                )
-            }
+            for (i in 1..3)
+                canvas.drawCircle(cx, cy, radius * i / 3f, paint)
 
-            canvas.drawLine(
-                cx - radius,
-                cy,
-                cx + radius,
-                cy,
-                paint
-            )
+            canvas.drawLine(cx - radius, cy, cx + radius, cy, paint)
+            canvas.drawLine(cx, cy - radius, cx, cy + radius, paint)
 
-            canvas.drawLine(
-                cx,
-                cy - radius,
-                cx,
-                cy + radius,
-                paint
-            )
+            bounds.set(cx - radius, cy - radius, cx + radius, cy + radius)
 
-            bounds.set(
-                cx - radius,
-                cy - radius,
-                cx + radius,
-                cy + radius
-            )
-
-            val angle = if (scanning) {
-                (SystemClock.uptimeMillis() % 2800L) *
-                    360f / 2800f
-            } else {
-                -45f
-            }
+            val angle =
+                if (scanning)
+                    (SystemClock.uptimeMillis() % 2800) * 360f / 2800
+                else -45f
 
             paint.color = cyan
             paint.strokeWidth = dp(2).toFloat()
-
-            canvas.drawArc(
-                bounds,
-                angle - 65f,
-                65f,
-                false,
-                paint
-            )
+            canvas.drawArc(bounds, angle - 65, 65f, false, paint)
 
             if (scanning) {
                 paint.style = Paint.Style.FILL
                 paint.color = 0x163ADDCD
-
-                canvas.drawArc(
-                    bounds,
-                    angle - 65f,
-                    65f,
-                    true,
-                    paint
-                )
+                canvas.drawArc(bounds, angle - 65, 65f, true, paint)
             }
 
             paint.style = Paint.Style.FILL
             paint.color = lime
+            canvas.drawCircle(cx, cy, dp(4).toFloat(), paint)
 
-            canvas.drawCircle(
-                cx,
-                cy,
-                dp(4).toFloat(),
-                paint
-            )
-
-            if (scanning && isShown) {
-                postInvalidateOnAnimation()
-            }
+            if (scanning && isShown) postInvalidateOnAnimation()
         }
     }
 
-    // =========================================================
-    // NETWORK DETECTION
-    // =========================================================
+    // ==================== NETWORK ====================
 
     override fun onResume() {
         super.onResume()
-
-        if (session == null) {
-            refreshNetwork()
-        }
+        if (session == null) refreshNetwork()
     }
 
-    private fun isLan(
-        capabilities: NetworkCapabilities
-    ): Boolean {
-        return !capabilities.hasTransport(
-            NetworkCapabilities.TRANSPORT_VPN
-        ) &&
-            capabilities.hasCapability(
-                NetworkCapabilities.NET_CAPABILITY_NOT_VPN
-            ) &&
+    private fun isLan(c: NetworkCapabilities) =
+        !c.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+            c.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
             (
-                capabilities.hasTransport(
-                    NetworkCapabilities.TRANSPORT_WIFI
-                ) ||
-                    capabilities.hasTransport(
-                        NetworkCapabilities.TRANSPORT_ETHERNET
-                    )
+                c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    c.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
                 )
-    }
 
     @Suppress("DEPRECATION")
     private fun availableLans(): List<Lan> {
-        val result = ArrayList<Lan>()
+        val result = arrayListOf<Lan>()
 
-        // Internet validation is not required.
-        // A local network can be usable without internet access.
-        for (network in connectivity.allNetworks) {
-            val capabilities =
-                connectivity.getNetworkCapabilities(network)
-                    ?: continue
+        connectivity.allNetworks.forEach { network ->
+            val caps = connectivity.getNetworkCapabilities(network) ?: return@forEach
+            if (!isLan(caps)) return@forEach
 
-            if (!isLan(capabilities)) continue
+            val links = connectivity.getLinkProperties(network) ?: return@forEach
+            val iface = links.interfaceName ?: return@forEach
 
-            val links =
-                connectivity.getLinkProperties(network)
-                    ?: continue
+            val transport =
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI))
+                    "Wi-Fi"
+                else "Ethernet"
 
-            val interfaceName = links.interfaceName ?: continue
-
-            val transport = if (
-                capabilities.hasTransport(
-                    NetworkCapabilities.TRANSPORT_WIFI
-                )
-            ) {
-                "Wi-Fi"
-            } else {
-                "Ethernet"
-            }
-
-            for (link in links.linkAddresses) {
-                val address =
-                    link.address as? Inet4Address ?: continue
+            links.linkAddresses.forEach { link ->
+                val address = link.address as? Inet4Address ?: return@forEach
 
                 if (
                     address.isLoopbackAddress ||
                     address.isAnyLocalAddress ||
                     address.isMulticastAddress
-                ) {
-                    continue
-                }
+                ) return@forEach
 
-                val ip = address.hostAddress ?: continue
+                val ip = address.hostAddress ?: return@forEach
 
-                result.add(
-                    Lan(
-                        network,
-                        ip,
-                        interfaceName,
-                        transport,
-                        Ipv4Subnet(
-                            ipv4Number(address),
-                            link.prefixLength
-                        )
-                    )
+                result += Lan(
+                    network,
+                    ip,
+                    iface,
+                    transport,
+                    Ipv4Subnet(ipv4Number(address), link.prefixLength)
                 )
             }
         }
 
-        val active = if (Build.VERSION.SDK_INT >= 23) {
-            connectivity.activeNetwork
-        } else {
-            null
-        }
-
-        return result.sortedWith(
-            compareBy<Lan>(
-                { if (it.network == active) 0 else 1 },
-                { if (it.transport == "Wi-Fi") 0 else 1 },
-                { it.interfaceName },
-                { it.ip }
-            )
-        )
+        return result
     }
 
     private fun refreshNetwork(): List<Lan> {
-        val lans = try {
-            availableLans()
-        } catch (_: SecurityException) {
-            selectedLan = null
+        val lans = try { availableLans() } catch (_: Exception) { emptyList() }
+        selectedLan = lans.firstOrNull()
 
-            txtIpAddress.text = "Unavailable"
-            txtTransport.text = "NO LINK"
-
-            setScanAppearance(false, "UNAVAILABLE")
-
-            txtSubnet.text = "Subnet: Unavailable"
-
-            txtStatus.text =
-                "Add ACCESS_NETWORK_STATE to AndroidManifest.xml"
-
-            btnScan.text = "Retry"
-
-            return emptyList()
-        }
-
-        val previous = selectedLan
-
-        val selected =
-            lans.firstOrNull { it == previous } ?: lans.firstOrNull()
-
-        selectedLan = selected
-        btnScan.isEnabled = true
-
-        if (selected == null) {
+        if (selectedLan == null) {
             txtIpAddress.text = "No local IPv4"
             txtTransport.text = "NO LINK"
-
-            setScanAppearance(false, "OFFLINE")
-
             txtSubnet.text = "Subnet: Not detected"
-
-            txtStatus.text =
-                "Connect to Wi-Fi or Ethernet with IPv4, then tap Retry"
-
+            txtStatus.text = "Connect to Wi-Fi or Ethernet"
             btnScan.text = "Retry"
+            setScanAppearance(false, "OFFLINE")
         } else {
-            showNetwork(selected)
-
-            txtStatus.text = "Ready to scan ${selected.transport}"
+            showNetwork(selectedLan!!)
+            txtStatus.text = "Ready to scan ${selectedLan!!.transport}"
             btnScan.text = "Start scan  →"
-
             setScanAppearance(false, "READY")
         }
 
@@ -1055,129 +736,89 @@ class MainActivity : AppCompatActivity() {
 
     private fun showNetwork(lan: Lan) {
         txtIpAddress.text = lan.ip
-
-        txtTransport.text =
-            lan.transport.toUpperCase(Locale.ROOT)
-
-        txtSubnet.text =
-            "${lan.subnet.cidr}\n" +
-                "Mask: ${ipv4Text(lan.subnet.mask)}"
+        txtTransport.text = lan.transport.toUpperCase(Locale.ROOT)
+        txtSubnet.text = "${lan.subnet.cidr}\nMask: ${ipv4Text(lan.subnet.mask)}"
     }
 
     private fun chooseNetwork() {
         val lans = refreshNetwork()
-
         if (lans.isEmpty()) return
 
         if (lans.size == 1) {
             chooseRange(lans[0])
-        } else {
-            val labels = lans.map {
-                "${it.transport} (${it.interfaceName})\n" +
-                    "${it.ip} - ${it.subnet.cidr}"
-            }.toTypedArray()
-
-            inputDialog = AlertDialog.Builder(this)
-                .setTitle("Choose a local network")
-                .setItems(labels) { _, index ->
-                    chooseRange(lans[index])
-                }
-                .setNegativeButton("Cancel", null)
-                .show()
+            return
         }
+
+        val labels = lans.map {
+            "${it.transport} (${it.interfaceName})\n${it.ip} - ${it.subnet.cidr}"
+        }.toTypedArray()
+
+        AlertDialog.Builder(this)
+            .setTitle("Choose a local network")
+            .setItems(labels) { _, i -> chooseRange(lans[i]) }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun chooseRange(lan: Lan) {
         selectedLan = lan
-        showNetwork(lan)
 
         if (lan.subnet.hostCount <= MAX_HOSTS_PER_SCAN) {
-            startScan(
-                lan,
-                lan.subnet.first,
-                lan.subnet.last
-            )
-
+            startScan(lan, lan.subnet.first, lan.subnet.last)
             return
         }
 
-        // Let the user choose a bounded part of the actual subnet.
         val block = lan.subnet.local and 0xFFFFFF00L
         val first = maxOf(lan.subnet.first, block)
-        val last = minOf(lan.subnet.last, block + 255L)
+        val last = minOf(lan.subnet.last, block + 255)
 
-        val layout = LinearLayout(this)
-        layout.orientation = LinearLayout.VERTICAL
+        val layout = column().apply {
+            setPadding(dp(20), 0, dp(20), 0)
+        }
 
-        val padding =
-            (20 * resources.displayMetrics.density).toInt()
+        val from = EditText(this).apply {
+            hint = "First IPv4 address"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(ipv4Text(first))
+        }
 
-        layout.setPadding(padding, 0, padding, 0)
+        val to = EditText(this).apply {
+            hint = "Last IPv4 address"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(ipv4Text(last))
+        }
 
-        val startInput = EditText(this)
-        startInput.hint = "First IPv4 address"
-        startInput.inputType = InputType.TYPE_CLASS_TEXT
-        startInput.setText(ipv4Text(first))
-
-        val endInput = EditText(this)
-        endInput.hint = "Last IPv4 address"
-        endInput.inputType = InputType.TYPE_CLASS_TEXT
-        endInput.setText(ipv4Text(last))
-
-        layout.addView(startInput)
-        layout.addView(endInput)
+        layout.addView(from)
+        layout.addView(to)
 
         val dialog = AlertDialog.Builder(this)
-            .setTitle("Choose a scan range")
-            .setMessage(
-                "${lan.subnet.cidr} contains " +
-                    "${lan.subnet.hostCount} host addresses. " +
-                    "Scan up to $MAX_HOSTS_PER_SCAN at a time. " +
-                    "Change this range to scan other parts."
-            )
+            .setTitle("Choose scan range")
             .setView(layout)
             .setPositiveButton("Scan", null)
             .setNegativeButton("Cancel", null)
             .create()
 
-        inputDialog = dialog
-
         dialog.setOnShowListener {
-            dialog.getButton(
-                AlertDialog.BUTTON_POSITIVE
-            ).setOnClickListener {
-                val from =
-                    parseIpv4(startInput.text.toString())
-
-                val to =
-                    parseIpv4(endInput.text.toString())
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val start = parseIpv4(from.text.toString())
+                val end = parseIpv4(to.text.toString())
 
                 when {
-                    from == null ||
-                        from !in lan.subnet.first..lan.subnet.last -> {
-                        startInput.error =
-                            "Enter an address inside ${lan.subnet.cidr}"
-                    }
+                    start == null || start !in lan.subnet.first..lan.subnet.last ->
+                        from.error = "Invalid address"
 
-                    to == null ||
-                        to !in lan.subnet.first..lan.subnet.last -> {
-                        endInput.error =
-                            "Enter an address inside ${lan.subnet.cidr}"
-                    }
+                    end == null || end !in lan.subnet.first..lan.subnet.last ->
+                        to.error = "Invalid address"
 
-                    to < from -> {
-                        endInput.error =
-                            "Must be at or after the first address"
-                    }
+                    end < start ->
+                        to.error = "Must be after first address"
 
-                    to - from + 1L > MAX_HOSTS_PER_SCAN -> {
-                        endInput.error =
-                            "Maximum $MAX_HOSTS_PER_SCAN addresses per scan"
-                    }
+                    end - start + 1 > MAX_HOSTS_PER_SCAN ->
+                        to.error = "Maximum $MAX_HOSTS_PER_SCAN addresses"
 
                     else -> {
                         dialog.dismiss()
-                        startScan(lan, from, to)
+                        startScan(lan, start, end)
                     }
                 }
             }
@@ -1186,42 +827,22 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
-    private fun isStillConnected(lan: Lan): Boolean {
-        return try {
-            val capabilities =
-                connectivity.getNetworkCapabilities(lan.network)
+    private fun isStillConnected(lan: Lan): Boolean = try {
+        val caps = connectivity.getNetworkCapabilities(lan.network)
+        val links = connectivity.getLinkProperties(lan.network)
 
-            val links =
-                connectivity.getLinkProperties(lan.network)
-
-            capabilities != null &&
-                isLan(capabilities) &&
-                links != null &&
-                links.interfaceName == lan.interfaceName &&
-                links.linkAddresses.any {
-                    it.address.hostAddress == lan.ip &&
-                        it.prefixLength == lan.subnet.prefix
-                }
-        } catch (_: SecurityException) {
-            false
-        }
+        caps != null &&
+            isLan(caps) &&
+            links?.interfaceName == lan.interfaceName
+    } catch (_: Exception) {
+        false
     }
 
-    // =========================================================
-    // SCANNING
-    // =========================================================
+    // ==================== SCAN ====================
 
-    private fun startScan(
-        lan: Lan,
-        first: Long,
-        last: Long
-    ) {
+    private fun startScan(lan: Lan, first: Long, last: Long) {
         if (!isStillConnected(lan)) {
             refreshNetwork()
-
-            txtStatus.text =
-                "Network changed. Tap Scan or Retry to refresh."
-
             return
         }
 
@@ -1230,222 +851,131 @@ class MainActivity : AppCompatActivity() {
 
         devices.clear()
         cards.clear()
+        notifiedThisScan.clear()
         deviceContainer.removeAllViews()
 
         checkedHosts = 0
         totalHosts = scan.total
-
         updateMetrics()
+
         setScanAppearance(true, "SCANNING")
 
         txtResultNote.text =
-            "Current scan · includes this device"
-
-        showNetwork(lan)
-
-        txtSubnet.append(
-            "\nScan range: ${ipv4Text(first)} - ${ipv4Text(last)}"
-        )
+            if (baselineEstablished)
+                "Current scan · watching for new devices"
+            else
+                "First scan · establishing device baseline"
 
         progressScan.max = scan.total
         progressScan.progress = 0
         progressScan.visibility = View.VISIBLE
 
         btnScan.text = "Stop scan  ■"
-        btnScan.isEnabled = true
-
         txtStatus.text = "Scanning... 0 / ${scan.total}"
 
-        // Always show this phone using the known local address.
-        val phoneName = localDeviceName()
+        val phone = localDeviceName()
 
-        displayDevice(
-            NetworkDevice(
-                lan.ip,
-                "$phoneName (This device)",
-                phoneName,
-                getMacAddress(lan.ip, lan.interfaceName),
-                "Android Phone / Tablet",
-                true,
-                mutableListOf()
-            )
+        val own = NetworkDevice(
+            lan.ip,
+            "$phone (This device)",
+            phone,
+            getMacAddress(lan.ip, lan.interfaceName),
+            "Android Phone / Tablet",
+            true,
+            mutableListOf()
         )
+
+        registerDevice(own)
+        displayDevice(own)
 
         repeat(minOf(WORKERS, scan.total)) {
             scan.executor.execute {
-                while (
-                    !scan.cancelled &&
-                    !Thread.currentThread().isInterrupted
-                ) {
-                    val value =
-                        scan.nextAddress.getAndIncrement()
+                while (!scan.cancelled && !Thread.currentThread().isInterrupted) {
+                    val address = scan.nextAddress.getAndIncrement()
+                    if (address > scan.last) break
 
-                    if (value > scan.last) break
-
-                    val result =
-                        scanHost(ipv4Text(value), scan)
-
+                    val result = scanHost(ipv4Text(address), scan)
                     if (scan.cancelled) break
 
                     ui.post {
-                        if (
-                            !destroyed &&
-                            session === scan &&
-                            !scan.cancelled
-                        ) {
-                            if (result != null) {
-                                displayDevice(result)
+                        if (!destroyed && session === scan && !scan.cancelled) {
+                            result?.let {
+                                registerDevice(it)
+                                displayDevice(it)
                             }
 
                             scan.completed++
                             checkedHosts = scan.completed
-
-                            txtCheckedCount.text =
-                                checkedHosts.toString()
-
-                            txtCheckedCount.contentDescription =
-                                "$checkedHosts of $totalHosts addresses checked"
-
+                            txtCheckedCount.text = checkedHosts.toString()
                             progressScan.progress = scan.completed
 
                             txtStatus.text =
                                 "Scanning... ${scan.completed} / ${scan.total}"
 
-                            if (scan.completed == scan.total) {
+                            if (scan.completed == scan.total)
                                 finishScan(scan)
-                            }
                         }
                     }
                 }
             }
         }
 
-        // Only a bounded number of worker jobs are queued.
         scan.executor.shutdown()
-
-        ui.postDelayed(networkMonitor, 1000L)
+        ui.postDelayed(networkMonitor, 1000)
     }
 
     private val networkMonitor = object : Runnable {
         override fun run() {
             val scan = session ?: return
 
-            if (!isStillConnected(scan.lan)) {
-                stopScan(
-                    "Network disconnected or changed. Tap Scan to refresh."
-                )
-            } else {
-                ui.postDelayed(this, 1000L)
-            }
+            if (!isStillConnected(scan.lan))
+                stopScan("Network disconnected or changed.")
+            else
+                ui.postDelayed(this, 1000)
         }
     }
 
-    private fun scanHost(
-        ip: String,
-        scan: ScanSession
-    ): NetworkDevice? {
-        val thisDevice = ip == scan.lan.ip
-
-        var reachable = thisDevice
-
-        val openPorts = mutableListOf<Int>()
+    private fun scanHost(ip: String, scan: ScanSession): NetworkDevice? {
+        val own = ip == scan.lan.ip
+        var reachable = own
+        val ports = mutableListOf<Int>()
 
         try {
             val address = InetAddress.getByName(ip)
 
-            // Java reachability cannot bind to an Android Network.
-            // Use it only on the default LAN without a visible VPN.
-            // TCP probes below use the selected Network.
-            if (
-                !reachable &&
-                canUseDefaultNetworkProbe(scan.lan)
-            ) {
-                try {
-                    val iface = NetworkInterface.getByName(
-                        scan.lan.interfaceName
-                    )
-
-                    if (
-                        iface != null &&
-                        address.isReachable(iface, 0, 400)
-                    ) {
-                        reachable = true
-                    }
-                } catch (_: Exception) {
-                }
-            }
-
-            for (port in PORTS) {
-                if (
-                    scan.cancelled ||
-                    Thread.currentThread().isInterrupted
-                ) {
-                    return null
-                }
+            PORTS.forEach { port ->
+                if (scan.cancelled) return null
 
                 when (probePort(address, port, scan)) {
                     2 -> {
                         reachable = true
-                        openPorts.add(port)
+                        ports += port
                     }
-
-                    // Explicit refusal is still a response.
                     1 -> reachable = true
                 }
             }
 
-            if (!reachable || scan.cancelled) return null
+            if (!reachable) return null
 
-            val hostname = if (thisDevice) {
-                localDeviceName()
-            } else {
-                getHostname(ip, scan)
-            }
+            val hostname =
+                if (own) localDeviceName()
+                else getHostname(ip)
 
             return NetworkDevice(
                 ip,
-                if (thisDevice) {
-                    "$hostname (This device)"
-                } else {
-                    hostname
-                },
+                if (own) "$hostname (This device)" else hostname,
                 hostname,
                 getMacAddress(ip, scan.lan.interfaceName),
-                determineDeviceType(
-                    hostname,
-                    openPorts,
-                    thisDevice
-                ),
-                thisDevice,
-                openPorts,
+                determineDeviceType(hostname, ports, own),
+                own,
+                ports,
                 true
             )
         } catch (_: Exception) {
-            // The local phone card remains visible.
             return null
         }
     }
 
-    @Suppress("DEPRECATION")
-    private fun canUseDefaultNetworkProbe(
-        lan: Lan
-    ): Boolean = try {
-        Build.VERSION.SDK_INT >= 23 &&
-            connectivity.activeNetwork == lan.network &&
-            connectivity.allNetworks.none {
-                connectivity.getNetworkCapabilities(it)
-                    ?.hasTransport(
-                        NetworkCapabilities.TRANSPORT_VPN
-                    ) == true
-            }
-    } catch (_: Exception) {
-        false
-    }
-
-    // Returns:
-    // 2 = open
-    // 1 = refused
-    // 0 = no conclusive response
     private fun probePort(
         address: InetAddress,
         port: Int,
@@ -1455,10 +985,7 @@ class MainActivity : AppCompatActivity() {
 
         try {
             socket = scan.lan.network.socketFactory.createSocket()
-
             scan.sockets[socket] = true
-
-            if (scan.cancelled) return 0
 
             socket.connect(
                 InetSocketAddress(address, port),
@@ -1466,137 +993,64 @@ class MainActivity : AppCompatActivity() {
             )
 
             return 2
-        } catch (error: Exception) {
-            var cause: Throwable? = error
+        } catch (e: Exception) {
+            var cause: Throwable? = e
 
             while (cause != null) {
                 if (
                     cause is ErrnoException &&
                     cause.errno == OsConstants.ECONNREFUSED
-                ) {
-                    return 1
-                }
+                ) return 1
 
                 cause = cause.cause
             }
 
             return 0
         } finally {
-            if (socket != null) {
-                scan.sockets.remove(socket)
-
-                try {
-                    socket.close()
-                } catch (_: Exception) {
-                }
+            socket?.let {
+                scan.sockets.remove(it)
+                try { it.close() } catch (_: Exception) {}
             }
         }
     }
 
-    // =========================================================
-    // DEVICE INFORMATION
-    // =========================================================
+    // ==================== DEVICE INFO ====================
 
-    private fun getHostname(
-        ip: String,
-        scan: ScanSession
-    ): String {
-        // Skip system reverse DNS when it may use another network.
-        if (!canUseDefaultNetworkProbe(scan.lan)) {
-            return "Unknown Device"
+    private fun getHostname(ip: String): String = try {
+        InetAddress.getByName(ip).canonicalHostName.let {
+            if (it.isBlank() || it == ip) "Unknown Device" else it
         }
-
-        return try {
-            val name =
-                InetAddress.getByName(ip).canonicalHostName
-
-            if (name.isNullOrBlank() || name == ip) {
-                "Unknown Device"
-            } else {
-                name
-            }
-        } catch (_: Exception) {
-            "Unknown Device"
-        }
+    } catch (_: Exception) {
+        "Unknown Device"
     }
 
     private fun localDeviceName(): String {
-        val manufacturer =
-            Build.MANUFACTURER.orEmpty().trim()
-
+        val manufacturer = Build.MANUFACTURER.orEmpty().trim()
         val model = Build.MODEL.orEmpty().trim()
 
-        if (manufacturer.isEmpty()) {
-            return if (model.isEmpty()) {
-                "Android device"
-            } else {
-                model
-            }
-        }
-
-        if (
-            model.toLowerCase(Locale.ROOT).startsWith(
-                manufacturer.toLowerCase(Locale.ROOT)
-            )
-        ) {
-            return model
-        }
-
-        return (
-            manufacturer.substring(0, 1)
-                .toUpperCase(Locale.ROOT) +
-                manufacturer.substring(1) +
-                " " +
-                model
-            ).trim()
+        return if (
+            model.toLowerCase(Locale.ROOT)
+                .startsWith(manufacturer.toLowerCase(Locale.ROOT))
+        ) model
+        else "$manufacturer $model".trim()
     }
 
-    private fun getMacAddress(
-        ip: String,
-        interfaceName: String
-    ): String {
-        if (Build.VERSION.SDK_INT >= 29) {
+    private fun getMacAddress(ip: String, iface: String): String {
+        if (Build.VERSION.SDK_INT >= 29)
             return "Unavailable (restricted by Android)"
-        }
 
         try {
-            File("/proc/net/arp").bufferedReader().use { reader ->
-                while (true) {
-                    val line = reader.readLine() ?: break
+            File("/proc/net/arp").forEachLine {
+                val p = it.trim().split(Regex("\\s+"))
 
-                    val parts =
-                        line.trim().split(Regex("\\s+"))
+                if (p.size >= 6 && p[0] == ip && p[5] == iface) {
+                    val mac = p[3].toUpperCase(Locale.ROOT)
 
-                    if (
-                        parts.size < 6 ||
-                        parts[0] != ip ||
-                        parts[5] != interfaceName
-                    ) {
-                        continue
-                    }
-
-                    val flags = parts[2]
-                        .removePrefix("0x")
-                        .toIntOrNull(16) ?: 0
-
-                    val mac =
-                        parts[3].toUpperCase(Locale.ROOT)
-
-                    if (
-                        (flags and 2) != 0 &&
-                        mac.matches(
-                            Regex("^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
-                        ) &&
-                        mac != "00:00:00:00:00:00" &&
-                        mac != "FF:FF:FF:FF:FF:FF" &&
-                        mac != "02:00:00:00:00:00"
-                    ) {
+                    if (mac.matches(Regex("^([0-9A-F]{2}:){5}[0-9A-F]{2}$")))
                         return mac
-                    }
                 }
             }
-        } catch (_: Exception) {
-        }
+        } catch (_: Exception) {}
 
         return "Unavailable"
     }
@@ -1608,188 +1062,159 @@ class MainActivity : AppCompatActivity() {
     ): String {
         if (own) return "Android Phone / Tablet"
 
-        val name = hostname.toLowerCase(Locale.ROOT)
+        val n = hostname.toLowerCase(Locale.ROOT)
 
         return when {
-            name.contains("chromecast") ||
-                name.contains("googlecast") -> {
-                "Chromecast / Google Cast"
-            }
-
-            listOf(
-                "printer",
-                "laserjet",
-                "epson",
-                "brother"
-            ).any { name.contains(it) } -> {
-                "Printer"
-            }
-
-            name.contains("roku") || name.contains("tv") -> {
-                "TV / Streaming Device"
-            }
-
-            name.contains("iphone") || name.contains("ipad") -> {
-                "Apple Mobile Device"
-            }
-
-            8008 in ports || 8009 in ports -> {
+            "chromecast" in n || 8008 in ports || 8009 in ports ->
                 "Google Cast Device"
-            }
 
-            9100 in ports || 631 in ports -> {
-                "Network Printer"
-            }
+            listOf("printer", "laserjet", "epson", "brother").any { it in n } ||
+                9100 in ports || 631 in ports ->
+                "Printer"
 
-            554 in ports -> {
+            "roku" in n || "tv" in n ->
+                "TV / Streaming Device"
+
+            "iphone" in n || "ipad" in n ->
+                "Apple Mobile Device"
+
+            554 in ports ->
                 "Camera / Media Device"
-            }
 
-            445 in ports || 139 in ports -> {
+            445 in ports || 139 in ports ->
                 "Computer / NAS"
-            }
 
-            53 in ports && (80 in ports || 443 in ports) -> {
+            53 in ports && (80 in ports || 443 in ports) ->
                 "Router / Network Device"
-            }
 
-            22 in ports -> {
+            22 in ports ->
                 "Computer / Network Device"
-            }
 
-            80 in ports || 443 in ports || 8080 in ports -> {
+            80 in ports || 443 in ports || 8080 in ports ->
                 "Web / Network Device"
-            }
 
-            else -> "Unknown Device"
+            else ->
+                "Unknown Device"
         }
     }
 
-    // =========================================================
-    // DEVICE CARDS
-    // =========================================================
+    // ==================== WEB INTERFACE ====================
+
+    private fun getWebInterfaceUrl(device: NetworkDevice): String? = when {
+        443 in device.openPorts -> "https://${device.ipAddress}"
+        80 in device.openPorts -> "http://${device.ipAddress}"
+        8080 in device.openPorts -> "http://${device.ipAddress}:8080"
+        else -> null
+    }
+
+    private fun openWebInterface(device: NetworkDevice) {
+        val url = getWebInterfaceUrl(device) ?: return
+
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (_: Exception) {
+            AlertDialog.Builder(this)
+                .setTitle("Unable to open")
+                .setMessage("Couldn't open:\n$url")
+                .setPositiveButton("OK", null)
+                .show()
+        }
+    }
+
+    // ==================== DEVICE CARDS ====================
 
     private fun displayDevice(device: NetworkDevice) {
         devices[device.ipAddress] = device
 
-        val old = cards[device.ipAddress]
-
-        val position = if (old == null) {
-            -1
-        } else {
-            deviceContainer.indexOfChild(old)
-        }
-
-        if (old != null) {
-            deviceContainer.removeView(old)
+        cards[device.ipAddress]?.let {
+            deviceContainer.removeView(it)
         }
 
         val card = column().apply {
-            background = surface()
+            background = surface(
+                panel,
+                if (device.isNewDevice) alertColor else border
+            )
             setPadding(dp(16), dp(16), dp(16), dp(16))
         }
 
         val top = row()
 
-        val marker = badge(
-            if (device.isThisDevice) "YOU" else "LAN",
-            if (device.isThisDevice) lime else cyan
-        )
-
-        top.addView(marker)
-
-        val title = label(
-            device.deviceName.removeSuffix(" (This device)"),
-            16f,
-            primaryText,
-            false,
-            true
-        ).apply {
-            setPadding(dp(12), 0, 0, 0)
+        val status = when {
+            device.isThisDevice -> "YOU"
+            device.isNewDevice -> "NEW"
+            else -> "KNOWN"
         }
 
+        val statusColor = when {
+            device.isThisDevice -> lime
+            device.isNewDevice -> alertColor
+            else -> cyan
+        }
+
+        top.addView(badge(status, statusColor))
+
         top.addView(
-            title,
-            LinearLayout.LayoutParams(0, -2, 1f)
+            label(
+                device.deviceName.removeSuffix(" (This device)"),
+                16f,
+                primaryText,
+                false,
+                true
+            ).apply { setPadding(dp(12), 0, 0, 0) }
         )
 
         card.addView(top)
 
-        addBlock(
-            card,
-            label(
-                device.ipAddress,
-                21f,
-                cyan,
-                true,
-                true
-            ),
-            16
-        )
+        addBlock(card, label(device.ipAddress, 21f, cyan, true, true), 16)
+        addBlock(card, label(device.deviceType, 12f, mutedText), 8)
 
-        addBlock(
-            card,
-            label(
-                if (device.isThisDevice) {
-                    "This Android device"
-                } else {
-                    "Estimated type · ${device.deviceType}"
-                },
-                12f,
-                mutedText
-            ),
-            8
-        )
+        if (device.isNewDevice)
+            addBlock(
+                card,
+                label("● NEW DEVICE DETECTED", 11f, alertColor, true, true),
+                10
+            )
 
-        val portSummary = when {
-            !device.portsChecked -> {
-                "Ports not checked yet"
-            }
+        if (device.firstSeen > 0)
+            addBlock(
+                card,
+                label(
+                    "First seen · ${formatSeenTime(device.firstSeen)}",
+                    11f,
+                    mutedText,
+                    true
+                ),
+                8
+            )
 
-            device.openPorts.isEmpty() -> {
-                "No open ports among those checked"
-            }
-
-            else -> {
-                device.openPorts.sorted().joinToString("  ·  ") {
-                    "$it/${getServiceName(it)}"
-                }
+        val ports = when {
+            !device.portsChecked -> "Ports not checked yet"
+            device.openPorts.isEmpty() -> "No open ports among those checked"
+            else -> device.openPorts.sorted().joinToString("  ·  ") {
+                "$it/${getServiceName(it)}"
             }
         }
 
-        addBlock(
-            card,
-            label(portSummary, 12f, lime, true),
-            12
-        )
+        addBlock(card, label(ports, 12f, lime, true), 12)
 
-        val footer = action("Inspect device  →")
-
-        footer.contentDescription =
-            "Inspect ${device.deviceName}, ${device.ipAddress}"
-
-        footer.setOnClickListener {
-            devices[device.ipAddress]?.let {
-                showDeviceDetails(it)
-            }
+        val inspect = action("Inspect device  →")
+        inspect.setOnClickListener {
+            devices[device.ipAddress]?.let { showDeviceDetails(it) }
         }
 
-        addBlock(card, footer, 14)
+        addBlock(card, inspect, 14)
 
         cards[device.ipAddress] = card
-
-        val params = LinearLayout.LayoutParams(-1, -2).apply {
-            topMargin = dp(12)
-        }
-
-        if (position >= 0) {
-            deviceContainer.addView(card, position, params)
-        } else {
-            deviceContainer.addView(card, params)
-        }
+        deviceContainer.addView(
+            card,
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) }
+        )
 
         updateMetrics()
     }
+
+    // ==================== DEVICE INSPECTOR ====================
 
     private fun showDeviceDetails(device: NetworkDevice) {
         val content = column().apply {
@@ -1797,88 +1222,94 @@ class MainActivity : AppCompatActivity() {
         }
 
         fun field(title: String, value: String) {
+            addBlock(content, label(title, 10f, mutedText, true), 18)
             addBlock(
                 content,
-                label(title, 10f, mutedText, true),
-                18
-            )
-
-            addBlock(
-                content,
-                label(
-                    value,
-                    14f,
-                    primaryText,
-                    true
-                ).apply {
+                label(value, 14f, primaryText, true).apply {
                     setTextIsSelectable(true)
                 },
                 7
             )
         }
 
+        field(
+            "STATUS",
+            when {
+                device.isThisDevice -> "THIS DEVICE"
+                device.isNewDevice -> "NEW DEVICE"
+                else -> "KNOWN DEVICE"
+            }
+        )
+
         field("IP ADDRESS", device.ipAddress)
         field("HOSTNAME", device.hostname)
         field("MAC ADDRESS", device.macAddress)
         field("DEVICE TYPE · ESTIMATED", device.deviceType)
 
-        field(
-            "OBSERVATION",
-            if (device.isThisDevice) {
-                "This device"
-            } else {
-                "Responded during this scan"
-            }
-        )
+        if (device.firstSeen > 0)
+            field("FIRST SEEN", formatFullTime(device.firstSeen))
+
+        if (device.lastSeen > 0)
+            field("LAST SEEN", formatFullTime(device.lastSeen))
 
         field(
             "OPEN TCP PORTS",
-            when {
-                !device.portsChecked -> {
-                    "Not checked yet / outside selected scan range"
+            if (device.openPorts.isEmpty())
+                "None detected among checked ports"
+            else
+                device.openPorts.sorted().joinToString("\n") {
+                    "$it  /  ${getServiceName(it)}"
                 }
-
-                device.openPorts.isEmpty() -> {
-                    "None detected among the checked ports"
-                }
-
-                else -> {
-                    device.openPorts.sorted().joinToString("\n") {
-                        "$it  /  ${getServiceName(it)}"
-                    }
-                }
-            }
         )
 
-        field(
-            "SERVICE IDENTIFICATION",
-            "Service names are inferred from port numbers."
-        )
+        // NEW WEB INTERFACE FEATURE
+        val webUrl = getWebInterfaceUrl(device)
 
-        val scroll = ScrollView(this).apply {
-            addView(content)
+        if (webUrl != null) {
+            field("WEB INTERFACE", webUrl)
+
+            val webButton = action("Open Web Interface  →", true)
+            webButton.setOnClickListener { openWebInterface(device) }
+            addBlock(content, webButton, 20)
         }
 
+        val scroll = ScrollView(this).apply { addView(content) }
+
         val dialog = AlertDialog.Builder(this)
-            .setTitle(
-                device.deviceName.removeSuffix(" (This device)")
-            )
+            .setTitle(device.deviceName.removeSuffix(" (This device)"))
             .setView(scroll)
             .setPositiveButton("Close", null)
             .create()
 
         inputDialog = dialog
-
         dialog.show()
 
         dialog.window?.setBackgroundDrawable(surface())
-
-        dialog.getButton(
-            AlertDialog.BUTTON_POSITIVE
-        ).setTextColor(lime)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(lime)
     }
 
-    private fun getServiceName(port: Int): String = when (port) {
+    // ==================== TIME / SERVICES ====================
+
+    private fun formatSeenTime(time: Long): String {
+        val diff = System.currentTimeMillis() - time
+
+        return when {
+            diff < 60_000 -> "Just now"
+            diff < 3_600_000 -> "${diff / 60_000} min ago"
+            diff < 86_400_000 ->
+                SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(time))
+            else ->
+                SimpleDateFormat("MMM d, h:mm a", Locale.getDefault()).format(Date(time))
+        }
+    }
+
+    private fun formatFullTime(time: Long) =
+        SimpleDateFormat(
+            "MMM d, yyyy · h:mm:ss a",
+            Locale.getDefault()
+        ).format(Date(time))
+
+    private fun getServiceName(port: Int) = when (port) {
         22 -> "SSH"
         53 -> "DNS"
         80 -> "HTTP"
@@ -1886,96 +1317,83 @@ class MainActivity : AppCompatActivity() {
         443 -> "HTTPS"
         445 -> "SMB"
         554 -> "RTSP"
-        631 -> "IPP Printing"
+        631 -> "IPP"
         8008 -> "Google Cast HTTP"
         8009 -> "Google Cast"
         8080 -> "HTTP Alternate"
         9100 -> "Printer"
-        else -> "Unknown Service"
+        else -> "Unknown"
     }
 
-    // =========================================================
-    // COMPLETION AND CLEANUP
-    // =========================================================
+    // ==================== COMPLETE / STOP ====================
 
     private fun finishScan(scan: ScanSession) {
         if (session !== scan) return
 
-        if (!isStillConnected(scan.lan)) {
-            stopScan(
-                "Network disconnected or changed; results are incomplete."
-            )
-
-            return
-        }
-
         ui.removeCallbacks(networkMonitor)
-
         session = null
 
         setScanAppearance(false, "COMPLETE")
-
-        txtResultNote.text =
-            "Last completed scan · includes this device"
-
         progressScan.visibility = View.GONE
         btnScan.text = "Scan again  →"
 
-        val peers = devices.values.count {
-            !it.isThisDevice
+        val peers = devices.values.count { !it.isThisDevice }
+        val newCount = devices.values.count { it.isNewDevice && !it.isThisDevice }
+
+        if (!baselineEstablished) {
+            baselineEstablished = true
+            preferences.edit().putBoolean(PREF_BASELINE, true).apply()
+
+            devices.values.forEach { it.isNewDevice = false }
+
+            txtResultNote.text =
+                "Baseline established · future scans will flag new devices"
+
+            txtStatus.text =
+                "Baseline complete - $peers other devices remembered"
+
+            devices.values.toList().forEach { displayDevice(it) }
+            return
         }
 
-        val partial =
-            scan.first != scan.lan.subnet.first ||
-                scan.last != scan.lan.subnet.last
+        txtResultNote.text =
+            if (newCount > 0)
+                "Scan complete · $newCount new device(s) detected"
+            else
+                "Scan complete · no new devices detected"
 
-        txtStatus.text = if (partial) {
-            "Selected range complete - $peers other devices responded"
-        } else {
-            "Subnet scan complete - $peers other devices responded"
-        }
+        txtStatus.text =
+            "Scan complete - $peers other devices responded"
     }
 
     private fun stopScan(message: String) {
         val scan = session ?: return
 
-        // Ignore late results from this session.
         session = null
-
         scan.stop()
-
-        setScanAppearance(false, "STOPPED")
-
-        txtResultNote.text =
-            "Partial scan results · includes this device"
 
         ui.removeCallbacks(networkMonitor)
 
+        setScanAppearance(false, "STOPPED")
         progressScan.visibility = View.GONE
         btnScan.text = "Scan again  →"
         btnScan.isEnabled = true
         txtStatus.text = message
+        txtResultNote.text = "Partial scan results"
     }
 
     override fun onStop() {
         inputDialog?.dismiss()
         inputDialog = null
-
-        stopScan(
-            "Scan stopped because the app left the screen"
-        )
-
+        stopScan("Scan stopped because the app left the screen")
         super.onStop()
     }
 
     override fun onDestroy() {
         destroyed = true
-
         session?.stop()
         session = null
-
         ui.removeCallbacksAndMessages(null)
-
         super.onDestroy()
     }
 }
